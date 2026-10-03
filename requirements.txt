@@ -2,3 +2,5 @@ streamlit
 crewai
 groq
 pypdf
+pillow
+pymupdf

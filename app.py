@@ -1,9 +1,12 @@
 import io
 import os
+import base64
 
 import streamlit as st
 from pypdf import PdfReader
-from crewai import Agent, Task, Crew, Process
+from PIL import Image
+from groq import Groq
+from crewai import Agent, Task, Crew, Process, LLM
 
 
 # =========================================================
@@ -26,8 +29,6 @@ st.markdown(
     """
     <style>
 
-    /* ---------- GLOBAL ---------- */
-
     .stApp {
         background-color: #F7F9FC;
     }
@@ -37,8 +38,6 @@ st.markdown(
         padding-top: 2rem;
         padding-bottom: 3rem;
     }
-
-    /* ---------- TYPOGRAPHY ---------- */
 
     html, body, [class*="css"] {
         font-family: Inter, -apple-system, BlinkMacSystemFont,
@@ -53,8 +52,6 @@ st.markdown(
     p, label {
         color: #4B5565;
     }
-
-    /* ---------- HEADER ---------- */
 
     .brand-container {
         display: flex;
@@ -89,8 +86,6 @@ st.markdown(
         font-size: 16px;
     }
 
-    /* ---------- SECTION TITLES ---------- */
-
     .section-title {
         font-size: 20px;
         font-weight: 700;
@@ -105,8 +100,6 @@ st.markdown(
         margin-bottom: 16px;
     }
 
-    /* ---------- INPUT CARDS ---------- */
-
     .input-card {
         background: #FFFFFF;
         border: 1px solid #E5E9F2;
@@ -115,8 +108,6 @@ st.markdown(
         box-shadow: 0 4px 18px rgba(31, 41, 55, 0.04);
         margin-bottom: 18px;
     }
-
-    /* ---------- UPLOAD AREA ---------- */
 
     [data-testid="stFileUploader"] {
         background: #FFFFFF;
@@ -130,8 +121,6 @@ st.markdown(
         border-radius: 10px;
     }
 
-    /* ---------- TEXT INPUTS ---------- */
-
     div[data-baseweb="input"],
     div[data-baseweb="textarea"] {
         border-radius: 10px;
@@ -140,8 +129,6 @@ st.markdown(
     input, textarea {
         font-size: 15px !important;
     }
-
-    /* ---------- PRIMARY BUTTON ---------- */
 
     div.stButton > button[kind="primary"] {
         width: 100%;
@@ -160,8 +147,6 @@ st.markdown(
         box-shadow: 0 10px 24px rgba(49, 87, 213, 0.28);
         transform: translateY(-1px);
     }
-
-    /* ---------- SIDEBAR ---------- */
 
     [data-testid="stSidebar"] {
         background-color: #FFFFFF;
@@ -214,8 +199,6 @@ st.markdown(
         margin-right: 6px;
     }
 
-    /* ---------- RESULT CONTAINER ---------- */
-
     .result-header {
         background: linear-gradient(
             135deg,
@@ -241,15 +224,11 @@ st.markdown(
         margin-top: 4px;
     }
 
-    /* ---------- EXPANDERS ---------- */
-
     [data-testid="stExpander"] {
         border: 1px solid #E2E6EF;
         border-radius: 12px;
         background: #FFFFFF;
     }
-
-    /* ---------- DIVIDER ---------- */
 
     hr {
         border-color: #E5E9F2;
@@ -283,17 +262,17 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 
 # =========================================================
-# GET GROQ API KEY FROM STREAMLIT SECRETS
+# GET API KEY
 # =========================================================
 
 def get_api_key():
-    """Read the Groq API key securely from Streamlit Secrets."""
+    """Read Groq API key securely from Streamlit Secrets."""
 
     try:
         api_key = st.secrets["GROQ_API_KEY"]
 
         if not api_key:
-            raise ValueError("GROQ_API_KEY is empty.")
+            return None
 
         return api_key
 
@@ -302,44 +281,362 @@ def get_api_key():
 
 
 # =========================================================
-# RESUME TEXT EXTRACTION
+# NORMAL PDF/TXT EXTRACTION
 # =========================================================
 
-def extract_resume_text(uploaded_file):
-    """Extract text from PDF or TXT files."""
+def extract_text_from_pdf(uploaded_file):
+    """Try extracting normal text from a PDF."""
+
+    pdf_bytes = uploaded_file.getvalue()
+
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+
+    pages = []
+
+    for page in reader.pages:
+        text = page.extract_text()
+
+        if text:
+            pages.append(text)
+
+    return "\n".join(pages).strip()
+
+
+def extract_text_from_txt(uploaded_file):
+    """Extract text from TXT."""
+
+    return uploaded_file.getvalue().decode(
+        "utf-8",
+        errors="ignore"
+    ).strip()
+
+
+# =========================================================
+# IMAGE PREPARATION
+# =========================================================
+
+def image_to_data_url(image_bytes, mime_type="image/jpeg"):
+    """Convert image bytes to a base64 data URL."""
+
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def prepare_image(image_bytes):
+    """
+    Resize an image so that OCR requests remain reasonably small.
+    """
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    max_width = 1600
+
+    if image.width > max_width:
+        ratio = max_width / image.width
+
+        new_height = int(image.height * ratio)
+
+        image = image.resize(
+            (max_width, new_height)
+        )
+
+    output = io.BytesIO()
+
+    image.save(
+        output,
+        format="JPEG",
+        quality=85,
+        optimize=True
+    )
+
+    return output.getvalue()
+
+
+# =========================================================
+# GROQ VISION OCR
+# =========================================================
+
+def extract_text_from_image(
+    image_bytes,
+    api_key,
+    mime_type="image/jpeg"
+):
+    """
+    Use Groq's vision model to read text from a resume image.
+    This is only used for OCR.
+    """
+
+    client = Groq(api_key=api_key)
+
+    prepared_image = prepare_image(image_bytes)
+
+    image_data_url = image_to_data_url(
+        prepared_image,
+        "image/jpeg"
+    )
+
+    response = client.chat.completions.create(
+        model="qwen/qwen3.8-27b",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """
+Read this resume image carefully.
+
+Extract all readable resume information as plain text.
+
+Preserve important details such as:
+- Name
+- Professional summary
+- Education
+- Skills
+- Work experience
+- Projects
+- Certifications
+- Courses
+- Achievements
+- Contact information if visible
+
+Do not analyze the candidate.
+Do not give career advice.
+Only transcribe the useful resume content accurately.
+If something is unclear, do not invent it.
+"""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_data_url
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0,
+        max_tokens=6000
+    )
+
+    text = response.choices[0].message.content
+
+    if not text:
+        raise RuntimeError(
+            "The vision model could not extract text from the image."
+        )
+
+    return text.strip()
+
+
+# =========================================================
+# IMAGE PDF OCR
+# =========================================================
+
+def extract_text_from_scanned_pdf(
+    uploaded_file,
+    api_key
+):
+    """
+    Convert scanned PDF pages into images and read them
+    with Groq Vision.
+    """
 
     try:
-        file_name = uploaded_file.name.lower()
+        import fitz
 
-        if file_name.endswith(".pdf"):
-            pdf_bytes = uploaded_file.read()
-            pdf_file = io.BytesIO(pdf_bytes)
+    except ImportError:
+        raise RuntimeError(
+            "PyMuPDF is required for scanned PDF support. "
+            "Add pymupdf to requirements.txt."
+        )
 
-            reader = PdfReader(pdf_file)
+    pdf_bytes = uploaded_file.getvalue()
 
-            pages = []
+    document = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    )
 
-            for page in reader.pages:
-                text = page.extract_text()
+    page_texts = []
 
-                if text:
-                    pages.append(text)
+    total_pages = len(document)
 
-            return "\n".join(pages)
+    if total_pages == 0:
+        raise RuntimeError(
+            "The PDF contains no pages."
+        )
 
-        elif file_name.endswith(".txt"):
-            return uploaded_file.read().decode(
-                "utf-8",
-                errors="ignore"
+    for start in range(0, total_pages, 3):
+
+        end = min(start + 3, total_pages)
+
+        batch_images = []
+
+        for page_number in range(start, end):
+
+            page = document.load_page(page_number)
+
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(1.5, 1.5),
+                alpha=False
             )
 
-        else:
-            raise ValueError("Unsupported file type.")
+            image_bytes = pixmap.tobytes("jpg")
 
-    except Exception as error:
-        raise RuntimeError(
-            f"Could not read the resume: {error}"
+            prepared_image = prepare_image(
+                image_bytes
+            )
+
+            image_data_url = image_to_data_url(
+                prepared_image,
+                "image/jpeg"
+            )
+
+            batch_images.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": image_data_url
+                    }
+                }
+            )
+
+        client = Groq(api_key=api_key)
+
+        content = [
+            {
+                "type": "text",
+                "text": """
+Read these resume pages carefully.
+
+Extract all readable resume information as plain text.
+
+Combine the information from all pages in their
+logical order.
+
+Preserve:
+- Name
+- Summary
+- Education
+- Skills
+- Experience
+- Projects
+- Certifications
+- Courses
+- Achievements
+- Contact details if visible
+
+Do not analyze the candidate.
+Do not give career advice.
+Only extract the resume information.
+Do not invent missing information.
+"""
+            }
+        ]
+
+        content.extend(batch_images)
+
+        response = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=8000
         )
+
+        text = response.choices[0].message.content
+
+        if text:
+            page_texts.append(text.strip())
+
+    document.close()
+
+    final_text = "\n\n".join(page_texts)
+
+    if not final_text.strip():
+        raise RuntimeError(
+            "Could not read text from the scanned PDF."
+        )
+
+    return final_text
+
+
+# =========================================================
+# UNIVERSAL RESUME EXTRACTION
+# =========================================================
+
+def extract_resume_text(
+    uploaded_file,
+    api_key
+):
+    """
+    Decide automatically whether the resume needs
+    normal text extraction or vision OCR.
+    """
+
+    file_name = uploaded_file.name.lower()
+
+    # ---------------- PDF ----------------
+
+    if file_name.endswith(".pdf"):
+
+        text = extract_text_from_pdf(
+            uploaded_file
+        )
+
+        # Normal text PDF
+        if len(text.strip()) >= 50:
+            return text
+
+        # Scanned/image PDF
+        return extract_text_from_scanned_pdf(
+            uploaded_file,
+            api_key
+        )
+
+    # ---------------- TXT ----------------
+
+    if file_name.endswith(".txt"):
+
+        text = extract_text_from_txt(
+            uploaded_file
+        )
+
+        if not text:
+            raise RuntimeError(
+                "The TXT resume is empty."
+            )
+
+        return text
+
+    # ---------------- JPG / JPEG / PNG ----------------
+
+    if file_name.endswith(
+        (".jpg", ".jpeg", ".png")
+    ):
+
+        mime_type = "image/png"
+
+        if file_name.endswith(
+            (".jpg", ".jpeg")
+        ):
+            mime_type = "image/jpeg"
+
+        return extract_text_from_image(
+            uploaded_file.getvalue(),
+            api_key,
+            mime_type
+        )
+
+    raise ValueError(
+        "Unsupported resume format."
+    )
 
 
 # =========================================================
@@ -348,29 +645,40 @@ def extract_resume_text(uploaded_file):
 
 def create_career_agent(api_key):
     """
-    Create one CrewAI agent using Groq.
+    Create ONE CrewAI agent.
+
+    Explicitly configure the Groq LLM so CrewAI receives
+    the complete model ID:
+    openai/gpt-oss-120b
     """
 
-    os.environ["OPENAI_API_KEY"] = api_key
-    os.environ["OPENAI_API_BASE"] = (
-        "https://api.groq.com/openai/v1"
+    career_llm = LLM(
+        model="groq/openai/gpt-oss-120b",
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1",
+        temperature=0.2
     )
 
     agent = Agent(
         role="AI Career Coach",
+
         goal=(
             "Analyze a user's resume and target job description, "
             "identify relevant skills and gaps, recommend realistic "
             "career directions, and create a personalized learning roadmap."
         ),
+
         backstory=(
             "You are an experienced career coach and hiring advisor. "
             "You carefully compare a candidate's existing skills with "
             "the requirements of their target role. You give practical, "
             "beginner-friendly and realistic career advice."
         ),
-        llm="openai/gpt-oss-120b",
+
+        llm=career_llm,
+
         verbose=False,
+
         allow_delegation=False
     )
 
@@ -387,9 +695,11 @@ def analyze_career(
     job_description,
     api_key
 ):
-    """Run the single CrewAI agent."""
+    """Run the single CrewAI career coach agent."""
 
-    agent = create_career_agent(api_key)
+    agent = create_career_agent(
+        api_key
+    )
 
     task_description = f"""
 You are analyzing a candidate for a career coaching report.
@@ -429,15 +739,21 @@ Your analysis MUST include:
 - Explain why each direction fits.
 
 5. Personalized Learning Roadmap
-Create a practical roadmap divided into:
-- 0–1 month
-- 1–3 months
-- 3–6 months
 
-For every period, recommend skills, learning activities, and practical projects.
+Create a practical roadmap divided into:
+
+0–1 month
+1–3 months
+3–6 months
+
+For every period, recommend:
+- Skills to learn
+- Learning activities
+- Practical projects
 
 6. Resume Improvement Suggestions
-- Give 3 to 5 specific suggestions for improving the resume for the target role.
+- Give 3 to 5 specific suggestions for improving the resume
+  for the target role.
 
 7. Final Recommendation
 - Give a short overall assessment.
@@ -447,16 +763,18 @@ IMPORTANT:
 - Base the analysis only on the provided resume and job information.
 - Do not claim the candidate has skills or experience that are not shown.
 - Keep the advice practical and beginner-friendly.
-- Use headings and bullet points.
+- Use clear headings and bullet points.
 """
 
     task = Task(
         description=task_description,
+
         expected_output=(
             "A detailed but concise career coaching report with clear headings, "
             "skill analysis, skill gaps, career directions, learning roadmap, "
             "resume suggestions, and final recommendation."
         ),
+
         agent=agent
     )
 
@@ -501,6 +819,7 @@ with st.sidebar:
             <div class="connection-title">
                 🔑 AI Connection
             </div>
+
             <div class="connection-status">
                 <span class="status-dot"></span>
                 Groq AI connected
@@ -512,7 +831,9 @@ with st.sidebar:
 
     st.divider()
 
-    st.caption("Powered by CrewAI + Groq")
+    st.caption(
+        "Powered by CrewAI + Groq"
+    )
 
 
 # =========================================================
@@ -535,9 +856,9 @@ st.markdown(
 )
 
 
-# ---------------------------------------------------------
-# RESUME
-# ---------------------------------------------------------
+# =========================================================
+# RESUME UPLOAD
+# =========================================================
 
 st.markdown(
     '<div class="input-card">',
@@ -549,22 +870,34 @@ st.markdown(
 )
 
 st.caption(
-    "Upload your current resume in PDF or TXT format."
+    "Supported formats: PDF, TXT, JPG and PNG. "
+    "Scanned/image-based resumes are supported."
 )
 
 uploaded_resume = st.file_uploader(
     "Upload your resume",
-    type=["pdf", "txt"],
+    type=[
+        "pdf",
+        "txt",
+        "jpg",
+        "jpeg",
+        "png"
+    ],
     label_visibility="collapsed",
-    help="Supported formats: PDF and TXT"
+    help=(
+        "Upload a text PDF, scanned PDF, TXT, JPG or PNG resume."
+    )
 )
 
-st.markdown("</div>", unsafe_allow_html=True)
+st.markdown(
+    "</div>",
+    unsafe_allow_html=True
+)
 
 
-# ---------------------------------------------------------
+# =========================================================
 # JOB INPUTS
-# ---------------------------------------------------------
+# =========================================================
 
 col1, col2 = st.columns(
     [1, 1],
@@ -610,7 +943,10 @@ with col2:
     )
 
 
-st.markdown("<br>", unsafe_allow_html=True)
+st.markdown(
+    "<br>",
+    unsafe_allow_html=True
+)
 
 
 # =========================================================
@@ -631,74 +967,135 @@ analyze_button = st.button(
 if analyze_button:
 
     # -----------------------------------------------------
-    # Validate API key
+    # API KEY
     # -----------------------------------------------------
 
     api_key = get_api_key()
 
     if not api_key:
+
         st.error(
             "AI connection is unavailable. "
             "Please check your Streamlit Secrets configuration."
         )
+
         st.stop()
 
     # -----------------------------------------------------
-    # Validate resume
+    # RESUME VALIDATION
     # -----------------------------------------------------
 
     if uploaded_resume is None:
+
         st.warning(
             "Please upload your resume before starting the analysis."
         )
+
         st.stop()
 
     # -----------------------------------------------------
-    # Validate target job
+    # TARGET JOB VALIDATION
     # -----------------------------------------------------
 
     if not target_job.strip():
+
         st.warning(
             "Please enter your target job."
         )
+
         st.stop()
 
     # -----------------------------------------------------
-    # Extract resume
+    # EXTRACT RESUME
     # -----------------------------------------------------
 
     try:
 
-        with st.spinner(
-            "Reading your resume..."
-        ):
+        file_name = uploaded_resume.name.lower()
 
-            resume_text = extract_resume_text(
-                uploaded_resume
-            )
+        if file_name.endswith(".pdf"):
+
+            with st.spinner(
+                "📄 Reading your PDF resume..."
+            ):
+
+                normal_text = extract_text_from_pdf(
+                    uploaded_resume
+                )
+
+            if len(normal_text.strip()) >= 50:
+
+                resume_text = normal_text
+
+            else:
+
+                with st.spinner(
+                    "🔍 This looks like an image-based resume. "
+                    "Reading the resume with AI vision..."
+                ):
+
+                    resume_text = extract_text_from_scanned_pdf(
+                        uploaded_resume,
+                        api_key
+                    )
+
+        elif file_name.endswith(".txt"):
+
+            with st.spinner(
+                "📄 Reading your resume..."
+            ):
+
+                resume_text = extract_text_from_txt(
+                    uploaded_resume
+                )
+
+        else:
+
+            with st.spinner(
+                "🔍 Reading your image-based resume..."
+            ):
+
+                mime_type = "image/png"
+
+                if file_name.endswith(
+                    (".jpg", ".jpeg")
+                ):
+                    mime_type = "image/jpeg"
+
+                resume_text = extract_text_from_image(
+                    uploaded_resume.getvalue(),
+                    api_key,
+                    mime_type
+                )
 
         if not resume_text.strip():
 
             st.error(
-                "The uploaded resume appears to contain "
-                "no readable text."
+                "The uploaded resume could not be read."
             )
 
             st.stop()
 
     except Exception as error:
 
-        st.error(str(error))
+        st.error(
+            "We could not read this resume."
+        )
+
+        st.caption(
+            f"Technical details: {str(error)}"
+        )
+
         st.stop()
 
     # -----------------------------------------------------
-    # Run AI analysis
+    # CAREER ANALYSIS
     # -----------------------------------------------------
 
     try:
 
         with st.spinner(
-            "Your AI Career Coach is analyzing your profile..."
+            "🤖 Your AI Career Coach is analyzing your profile..."
         ):
 
             report = analyze_career(
@@ -715,23 +1112,22 @@ if analyze_button:
         st.markdown(
             """
             <div class="result-header">
+
                 <div class="result-header-title">
                     📊 Your Career Analysis
                 </div>
+
                 <div class="result-header-text">
                     Personalized insights based on your resume
                     and target career.
                 </div>
+
             </div>
             """,
             unsafe_allow_html=True
         )
 
         st.markdown(report)
-
-    # -----------------------------------------------------
-    # Error handling
-    # -----------------------------------------------------
 
     except Exception as error:
 

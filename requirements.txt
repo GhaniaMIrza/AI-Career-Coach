@@ -1,6 +1,7 @@
 streamlit
-crewai
+crewai[litellm]
 groq
 pypdf
 pillow
 pymupdf
+litellm

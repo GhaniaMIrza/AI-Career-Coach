@@ -6,7 +6,8 @@ The application analyzes a user's resume and target job to identify relevant ski
 
 ## ✨ Features
 
-- Upload PDF or TXT resumes
+- Upload PDF, TXT, JPG, JPEG, or PNG resumes
+- Support for scanned and image-based resumes
 - Enter a target job
 - Add a job description
 - Analyze relevant skills
@@ -15,7 +16,8 @@ The application analyzes a user's resume and target job to identify relevant ski
 - Generate a personalized learning roadmap
 - Suggest resume improvements
 - Uses a single CrewAI agent
-- Uses Groq's openai/gpt-oss-120b model
+- Uses Groq's `openai/gpt-oss-120b` model for career analysis
+- Uses Groq's `qwen/qwen3.8-27b` vision model for image-based and scanned resume text extraction
 - Secure API key management through Streamlit Secrets
 - No database or authentication required
 
@@ -27,6 +29,9 @@ The application analyzes a user's resume and target job to identify relevant ski
 - Groq
 - GPT-OSS 120B
 - pypdf
+- Pillow
+- PyMuPDF
+- LiteLLM
 
 ## 📁 Project Structure
 
